@@ -1,0 +1,22 @@
+services:
+  whatsapp-claude-bot:
+    # Imagen ya compilada por GitHub Actions (ver .github/workflows/docker-publish.yml).
+    # El VPS solo descarga esto - nunca compila nada aqui.
+    # Reemplaza <TU_USUARIO>/<TU_REPO> por los tuyos (todo en minusculas).
+    image: ghcr.io/marioespino81-boop/whatsisso-claudebot:latest
+    container_name: whatsapp-claude-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent WhatsApp session (linked device auth) + message DB + bridge token.
+      # Without this volume you'd have to re-scan the pairing code on every deploy.
+      - whatsapp_store:/app/bridge/store
+    # No ports need to be published - bridge and autoresponder only talk to
+    # each other over localhost inside the container. Uncomment only if you
+    # want to hit the bridge REST API from outside for debugging.
+    # ports:
+    #   - "8080:8080"
+
+volumes:
+  whatsapp_store:
