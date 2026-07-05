@@ -84,3 +84,33 @@ Sigue viendo los logs. El bridge imprime un codigo QR en texto. En tu telefono:
 ## 6. Configurar a quien responde el bot
 
 Limita `ALLOWED_CHAT_JIDS` en tu `.env` a tu propio numero para probar:
+
+Redeploy (`docker compose up -d`) despues de cambiar esta variable.
+
+## 7. Probar
+
+Pidele a otro numero que te escriba. En los logs deberias ver:
+
+
+## Limitaciones y riesgos
+
+- **No es oficial.** Usa la API no documentada de WhatsApp Web. Un uso
+  agresivo puede resultar en bloqueo de tu cuenta de WhatsApp.
+- **Los mensajes salen desde tu numero.** Quien te escriba no puede
+  distinguir si respondiste tu o Claude.
+- **Costo por token** en tu API key de Anthropic (aparte de tu suscripcion).
+- **El historial de conversacion vive en memoria**: se pierde si el
+  contenedor se reinicia.
+- **Seguridad:** el `.env` contiene tu API key y el token del bridge -
+  nunca lo subas a un repo publico.
+
+## Resetear todo
+
+```bash
+docker compose down
+docker volume rm whatsapp-claude-bot_whatsapp_store
+docker compose pull
+docker compose up -d
+```
+
+Vuelve a escanear el QR (paso 5).
