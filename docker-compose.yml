@@ -15,6 +15,9 @@ services:
     # No ports need to be published - bridge and autoresponder only talk to
     # each other over localhost inside the container. Uncomment only if you
     # want to hit the bridge REST API from outside for debugging.
+    # Prompt de negocio (texto largo con formato) - se lee en vez de SYSTEM_PROMPT.
+      # El archivo system-prompt.md debe existir junto a este docker-compose.yml.
+      - ./system-prompt.md:/app/config/system-prompt.md:ro
     # ports:
     #   - "8080:8080"
 
