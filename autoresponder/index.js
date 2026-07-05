@@ -23,13 +23,23 @@ const ALLOWED_CHAT_JIDS = (process.env.ALLOWED_CHAT_JIDS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// NOTE: estas dos variables suelen faltar en el PRIMER arranque (el bridge
+// todavia no genero su token, o el usuario aun no puso su API key). Antes
+// esto hacia process.exit(1), lo cual mataba tambien al bridge (el
+// entrypoint.sh apaga todo el contenedor si un proceso muere) justo antes de
+// que alcanzara a imprimir su banner con el token y el QR - un circulo
+// vicioso. Ahora solo avisamos y seguimos corriendo; las funciones que los
+// necesitan (generateReply/sendReply) fallan con un error claro si se usan
+// sin configurar.
 if (!ANTHROPIC_API_KEY) {
-  console.error("[fatal] ANTHROPIC_API_KEY no esta configurada. Abortando.");
-  process.exit(1);
+  console.warn(
+    "[warn] ANTHROPIC_API_KEY no esta configurada todavia - el bot no podra generar respuestas hasta que la configures y reinicies."
+  );
 }
 if (!BRIDGE_TOKEN) {
-  console.error("[fatal] WHATSAPP_BRIDGE_TOKEN no esta configurada. Abortando.");
-  process.exit(1);
+  console.warn(
+    "[warn] WHATSAPP_BRIDGE_TOKEN no esta configurada todavia - copia el token que imprime el bridge arriba en estos logs, ponlo en .env y reinicia."
+  );
 }
 if (ALLOWED_CHAT_JIDS.length === 0) {
   console.warn(
@@ -38,7 +48,7 @@ if (ALLOWED_CHAT_JIDS.length === 0) {
   );
 }
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
 // In-memory conversation history per chat. Lost on restart by design (MVP) -
 // swap for a real store (SQLite/Redis) if you need persistence.
@@ -76,6 +86,12 @@ async function sendReply(recipient, message) {
 }
 
 async function generateReply(chatJID, incomingText) {
+  if (!anthropic) {
+    throw new Error("ANTHROPIC_API_KEY no configurada - no se puede generar respuesta");
+  }
+  if (!BRIDGE_TOKEN) {
+    throw new Error("WHATSAPP_BRIDGE_TOKEN no configurada - no se puede enviar la respuesta");
+  }
   pushToHistory(chatJID, "user", incomingText);
   const history = getHistory(chatJID);
 
@@ -102,6 +118,9 @@ app.post("/whatsapp/webhook", async (req, res) => {
   const payload = req.body || {};
   const { sender, content, chatJID, isFromMe, mediaType } = payload;
 
+  // Ack immediately-ish; we still await the work below, but this keeps the
+  // intent clear: WhatsApp/bridge shouldn't be blocked waiting on us longer
+  // than necessary, and any failure past this point is just logged.
   if (isFromMe) {
     return res.status(200).json({ skipped: "isFromMe" });
   }
