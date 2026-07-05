@@ -1,1 +1,15 @@
-
+{
+  "name": "whatsapp-claude-autoresponder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Recibe webhooks del bridge de WhatsApp (whatsmeow), genera respuestas con la API de Claude y las reenvia via el bridge.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "express": "^4.19.2"
+  }
+}
