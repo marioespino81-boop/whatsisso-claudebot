@@ -1,5 +1,5 @@
 # ---- Stage 1: compile the Go WhatsApp bridge (whatsmeow) ----
-FROM golang:1.24-bookworm AS bridge-builder
+FROM golang:1.25-bookworm AS bridge-builder
 
 WORKDIR /src
 RUN git clone --depth 1 https://github.com/verygoodplugins/whatsapp-mcp.git .
