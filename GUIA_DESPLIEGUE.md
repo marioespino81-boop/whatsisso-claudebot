@@ -84,9 +84,10 @@ Sigue viendo los logs. El bridge imprime un codigo QR en texto. En tu telefono:
 ## 6. Configurar a quien responde el bot
 
 Limita `ALLOWED_CHAT_JIDS` en tu `.env` a tu propio numero para probar:
-
+ALLOWED_CHAT_JIDS=521XXXXXXXXXX@s.whatsapp.net
 Redeploy (`docker compose up -d`) despues de cambiar esta variable.
-
+[in] <chatJID> (<sender>): <mensaje>
+[out] <chatJID>: <respuesta generada por Claude>
 ## 7. Probar
 
 Pidele a otro numero que te escriba. En los logs deberias ver:
