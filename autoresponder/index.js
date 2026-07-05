@@ -146,6 +146,22 @@ if (!OWNER_CHAT_JID) {
 
 const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
+// CAUSA RAIZ del incidente de Estados publicados automaticamente: el bridge
+// (whatsmeow) tambien emite como "mensaje entrante" los Estados que publican
+// tus contactos (llegan con chatJID = "status@broadcast"), y sin este filtro
+// el bot los trataba como si fueran un cliente escribiendole, generaba una
+// respuesta con Claude, y la mandaba de vuelta a "status@broadcast" - que en
+// WhatsApp/whatsmeow significa "publica esto como tu propio Estado", visible
+// para todos tus contactos (por eso lo vio el dueno y sus clientes).
+// Esta funcion bloquea CUALQUIER JID de difusion/estado en dos puntos:
+// (1) al recibir el webhook (para no generar respuesta ni gastar tokens), y
+// (2) dentro de sendReply, como ultima linea de defensa, para que ningun otro
+// bug futuro pueda volver a publicar algo como Estado.
+function isBroadcastJID(jid) {
+  if (!jid || typeof jid !== "string") return false;
+  return jid === "status@broadcast" || jid.endsWith("@broadcast") || jid.endsWith("@newsletter");
+}
+
 // Tool que el modelo puede "usar" cuando el prompt le indica derivar la
 // conversacion a un humano (factura, cliente molesto, comprobante sin numero
 // de pedido, etc). Al usarla, notificamos por WhatsApp al ADMIN_CHAT_JID y
@@ -184,6 +200,13 @@ function trimHistory(chatJID) {
 }
 
 async function sendReply(recipient, message) {
+  // Ultima linea de defensa: nunca enviar nada a un JID de difusion/estado,
+  // pase lo que pase mas arriba en el flujo (ver isBroadcastJID arriba).
+  if (isBroadcastJID(recipient)) {
+    throw new Error(
+      `sendReply bloqueado: intento de enviar a JID de difusion/estado (${recipient}). Esto NO se envia nunca.`
+    );
+  }
   const res = await fetch(`${BRIDGE_URL}/send`, {
     method: "POST",
     headers: {
@@ -293,6 +316,13 @@ app.post("/whatsapp/webhook", async (req, res) => {
 
   if (!chatJID) {
     return res.status(400).json({ error: "missing chatJID" });
+  }
+
+  // BLOQUEO DE SEGURIDAD: nunca procesar ni contestar Estados/difusiones.
+  // Ver la explicacion completa junto a isBroadcastJID() mas arriba.
+  if (isBroadcastJID(chatJID)) {
+    console.log(`[skip] mensaje de difusion/estado ignorado: ${chatJID} (sender=${sender})`);
+    return res.status(200).json({ skipped: "broadcast-or-status" });
   }
 
   const trimmedContent = (content || "").trim();
