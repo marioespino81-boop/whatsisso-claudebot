@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const Anthropic = require("@anthropic-ai/sdk");
 
@@ -15,6 +16,9 @@ const HISTORY_LIMIT = parseInt(process.env.HISTORY_LIMIT || "20", 10);
 // Numero (JID) del dueno del negocio - recibe notificaciones cuando el bot
 // deriva una conversacion a un humano. Ej: 5216146826814@s.whatsapp.net
 const ADMIN_CHAT_JID = process.env.ADMIN_CHAT_JID || "";
+// Numero (JID) autorizado para mandar comandos /actualizar, /ver, /borrar.
+// Por defecto es el mismo que ADMIN_CHAT_JID, pero puede separarse.
+const OWNER_CHAT_JID = process.env.OWNER_CHAT_JID || ADMIN_CHAT_JID;
 
 // El system prompt puede venir de un archivo (recomendado para prompts largos
 // con formato, como negocio.md) o de la variable SYSTEM_PROMPT (para uno corto).
@@ -34,9 +38,68 @@ try {
         `[autoresponder] system prompt cargado desde ${SYSTEM_PROMPT_FILE} (${fileContent.length} caracteres)`
       );
     }
+  } else {
+    console.log(
+      `[autoresponder] SYSTEM_PROMPT_FILE (${SYSTEM_PROMPT_FILE}) no existe - usando SYSTEM_PROMPT / prompt por defecto`
+    );
   }
 } catch (err) {
   console.warn(`[warn] no se pudo leer SYSTEM_PROMPT_FILE (${SYSTEM_PROMPT_FILE}): ${err.message}`);
+}
+
+// Recordatorio de formato fijo, siempre se agrega al prompt efectivo para
+// evitar que el modelo use doble asterisco (Markdown) en vez del formato
+// de negritas real de WhatsApp (un solo asterisco).
+const WHATSAPP_FORMAT_REMINDER =
+  "\n\n---\nFormato WhatsApp: para negritas usa UN SOLO asterisco (*asi*), nunca doble asterisco (**asi**).";
+
+// ---- Actualizaciones dinamicas (via comandos de WhatsApp del dueno) ----
+// Se guardan en el volumen persistente para sobrevivir reinicios/redeploys.
+const DYNAMIC_UPDATES_FILE = process.env.DYNAMIC_UPDATES_FILE || "/app/bridge/store/dynamic-updates.md";
+const DYNAMIC_UPDATES_MAX_CHARS = parseInt(process.env.DYNAMIC_UPDATES_MAX_CHARS || "6000", 10);
+
+let dynamicUpdates = "";
+try {
+  if (fs.existsSync(DYNAMIC_UPDATES_FILE)) {
+    dynamicUpdates = fs.readFileSync(DYNAMIC_UPDATES_FILE, "utf8");
+    if (dynamicUpdates.trim()) {
+      console.log(`[autoresponder] actualizaciones dinamicas cargadas (${dynamicUpdates.length} caracteres)`);
+    }
+  }
+} catch (err) {
+  console.warn(`[warn] no se pudo leer DYNAMIC_UPDATES_FILE (${DYNAMIC_UPDATES_FILE}): ${err.message}`);
+}
+
+function saveDynamicUpdates() {
+  try {
+    fs.mkdirSync(path.dirname(DYNAMIC_UPDATES_FILE), { recursive: true });
+    fs.writeFileSync(DYNAMIC_UPDATES_FILE, dynamicUpdates, "utf8");
+  } catch (err) {
+    console.error(`[error] no se pudo guardar DYNAMIC_UPDATES_FILE: ${err.message}`);
+  }
+}
+
+function appendDynamicUpdate(text) {
+  const stamp = new Date().toISOString().slice(0, 10);
+  dynamicUpdates += `\n\n### Actualizacion ${stamp}\n${text.trim()}`;
+  if (dynamicUpdates.length > DYNAMIC_UPDATES_MAX_CHARS) {
+    // Conserva solo lo mas reciente si crece demasiado (controla costo de tokens).
+    dynamicUpdates = dynamicUpdates.slice(dynamicUpdates.length - DYNAMIC_UPDATES_MAX_CHARS);
+  }
+  saveDynamicUpdates();
+}
+
+function clearDynamicUpdates() {
+  dynamicUpdates = "";
+  saveDynamicUpdates();
+}
+
+function getEffectiveSystemPrompt() {
+  let prompt = SYSTEM_PROMPT;
+  if (dynamicUpdates.trim()) {
+    prompt += `\n\n---\n\n## Actualizaciones recientes (agregadas por el dueno via WhatsApp)\n${dynamicUpdates}`;
+  }
+  return prompt + WHATSAPP_FORMAT_REMINDER;
 }
 
 // Comma-separated allowlist of chat JIDs (phone@s.whatsapp.net or group JIDs).
@@ -73,6 +136,11 @@ if (ALLOWED_CHAT_JIDS.length === 0) {
 if (!ADMIN_CHAT_JID) {
   console.warn(
     "[warn] ADMIN_CHAT_JID no esta configurado - las derivaciones a humano no se notificaran a nadie, solo se le contestara al cliente."
+  );
+}
+if (!OWNER_CHAT_JID) {
+  console.warn(
+    "[warn] OWNER_CHAT_JID no esta configurado - nadie podra usar los comandos /actualizar, /ver, /borrar."
   );
 }
 
@@ -160,10 +228,12 @@ async function generateReply(chatJID, incomingText) {
   const history = getHistory(chatJID);
   history.push({ role: "user", content: incomingText });
 
+  const systemPrompt = getEffectiveSystemPrompt();
+
   let response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     tools: TOOLS,
     messages: history,
   });
@@ -194,7 +264,7 @@ async function generateReply(chatJID, incomingText) {
     response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       tools: TOOLS,
       messages: history,
     });
@@ -225,12 +295,61 @@ app.post("/whatsapp/webhook", async (req, res) => {
     return res.status(400).json({ error: "missing chatJID" });
   }
 
+  const trimmedContent = (content || "").trim();
+
+  // ---- Comandos del dueno (solo desde OWNER_CHAT_JID) ----
+  // Permiten agregar/ver/borrar informacion de negocio sin tocar codigo ni
+  // servidor. Se revisan ANTES de la lista blanca de clientes, para que
+  // funcionen incluso si el dueno no esta en ALLOWED_CHAT_JIDS.
+  if (OWNER_CHAT_JID && chatJID === OWNER_CHAT_JID) {
+    const lower = trimmedContent.toLowerCase();
+
+    if (lower.startsWith("/actualizar")) {
+      const info = trimmedContent.slice("/actualizar".length).trim();
+      if (info) {
+        appendDynamicUpdate(info);
+        console.log(`[owner] /actualizar: ${info.slice(0, 120)}`);
+        await sendReply(chatJID, "✅ Informacion agregada. El bot ya la va a usar en las conversaciones con clientes.");
+      } else {
+        await sendReply(chatJID, "Usa: /actualizar <texto a agregar>\nEj: /actualizar Nueva promo: envio gratis en pedidos arriba de $1000 MXN durante julio.");
+      }
+      return res.status(200).json({ ok: true, command: "actualizar" });
+    }
+
+    if (lower === "/ver") {
+      const body = dynamicUpdates.trim() || "(sin actualizaciones todavia)";
+      await sendReply(chatJID, `📋 Actualizaciones actuales:\n${body}`);
+      return res.status(200).json({ ok: true, command: "ver" });
+    }
+
+    if (lower === "/borrar") {
+      clearDynamicUpdates();
+      console.log("[owner] /borrar: actualizaciones dinamicas borradas");
+      await sendReply(chatJID, "🗑️ Actualizaciones borradas. El bot vuelve a usar solo el prompt base.");
+      return res.status(200).json({ ok: true, command: "borrar" });
+    }
+
+    if (lower === "/ayuda" || lower === "/help") {
+      await sendReply(
+        chatJID,
+        "Comandos disponibles:\n" +
+          "/actualizar <texto> - agrega info nueva (promos, cambios de precio, etc)\n" +
+          "/ver - muestra las actualizaciones actuales\n" +
+          "/borrar - borra todas las actualizaciones"
+      );
+      return res.status(200).json({ ok: true, command: "ayuda" });
+    }
+    // Si no es un comando reconocido, sigue el flujo normal - el dueno
+    // tambien puede platicar con el bot para probarlo (si su numero esta
+    // en ALLOWED_CHAT_JIDS).
+  }
+
   if (ALLOWED_CHAT_JIDS.length > 0 && !ALLOWED_CHAT_JIDS.includes(chatJID)) {
     console.log(`[skip] chat no permitido: ${chatJID} (sender=${sender})`);
     return res.status(200).json({ skipped: "not-allowlisted" });
   }
 
-  let incomingText = (content || "").trim();
+  let incomingText = trimmedContent;
   if (!incomingText && mediaType) {
     incomingText =
       mediaType === "image"
