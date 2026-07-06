@@ -12,12 +12,16 @@ services:
       # Persistent WhatsApp session (linked device auth) + message DB + bridge token.
       # Without this volume you'd have to re-scan the pairing code on every deploy.
       - whatsapp_store:/app/bridge/store
-    # No ports need to be published - bridge and autoresponder only talk to
-    # each other over localhost inside the container. Uncomment only if you
-    # want to hit the bridge REST API from outside for debugging.
-    # Prompt de negocio (texto largo con formato) - se lee en vez de SYSTEM_PROMPT.
+      # Prompt de negocio (texto largo con formato) - se lee en vez de SYSTEM_PROMPT.
       # El archivo system-prompt.md debe existir junto a este docker-compose.yml.
       - ./system-prompt.md:/app/config/system-prompt.md:ro
+    # Solo se publica el puerto 8790 (webhook de WooCommerce) - es el UNICO
+    # que debe ser alcanzable desde internet. El bridge (8080) y el webhook
+    # de WhatsApp (8769) siguen siendo solo-localhost dentro del contenedor.
+    ports:
+      - "8790:8790"
+    # Descomenta solo si necesitas pegarle a la API REST del bridge desde
+    # fuera del contenedor para depurar (normalmente NO hace falta):
     # ports:
     #   - "8080:8080"
 
