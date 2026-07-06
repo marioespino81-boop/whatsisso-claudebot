@@ -109,6 +109,16 @@ const ALLOWED_CHAT_JIDS = (process.env.ALLOWED_CHAT_JIDS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Los chats de grupo en WhatsApp siempre tienen JID terminado en "@g.us".
+// Por defecto el bot NUNCA responde en grupos (RESPOND_IN_GROUPS=false),
+// para evitar que conteste dentro de grupos de clientes/familiares/equipo.
+// Si en algun momento se necesita un grupo especifico, se puede poner
+// RESPOND_IN_GROUPS=true y controlar el acceso con ALLOWED_CHAT_JIDS.
+const RESPOND_IN_GROUPS = (process.env.RESPOND_IN_GROUPS || "false").trim().toLowerCase() === "true";
+function isGroupJID(jid) {
+  return typeof jid === "string" && jid.endsWith("@g.us");
+}
+
 // NOTE: estas dos variables suelen faltar en el PRIMER arranque (el bridge
 // todavia no genero su token, o el usuario aun no puso su API key). Antes
 // esto hacia process.exit(1), lo cual mataba tambien al bridge (el
@@ -301,6 +311,118 @@ async function generateReply(chatJID, incomingText) {
   return replyText;
 }
 
+// ---- Notificaciones de pedidos de WooCommerce ----
+// Cuando un pedido cambia de estado en WooCommerce (nuevo, procesando,
+// completado, cancelado, etc.) le mandamos un WhatsApp automatico al
+// cliente. Esto NO pasa por Claude - son mensajes de plantilla fijos, para
+// que la informacion del pedido (numero, productos, total) sea siempre
+// exacta y nunca la "invente" el modelo.
+const crypto = require("crypto");
+
+// Puerto DEDICADO y SEPARADO del puerto interno 8769. Es el UNICO puerto de
+// este servicio pensado para publicarse a internet (para que WooCommerce lo
+// pueda llamar). El puerto 8769 (webhook del bridge de WhatsApp) NUNCA debe
+// exponerse a internet - solo el bridge le habla por localhost.
+const WOOCOMMERCE_PORT = parseInt(process.env.WOOCOMMERCE_PORT || "8790", 10);
+
+// Secreto configurado en WooCommerce (Ajustes > Avanzado > Webhooks > tu
+// webhook > "Secreto"). Se usa para verificar la firma HMAC de cada
+// solicitud entrante y asegurarnos de que en verdad viene de WooCommerce.
+const WC_WEBHOOK_SECRET = process.env.WC_WEBHOOK_SECRET || "";
+if (!WC_WEBHOOK_SECRET) {
+  console.warn(
+    "[warn] WC_WEBHOOK_SECRET no esta configurado - las notificaciones de pedidos de WooCommerce estan DESACTIVADAS por seguridad hasta que lo configures (debe coincidir con el secreto del webhook en WooCommerce)."
+  );
+}
+
+const WC_ORDER_STATUS_FILE = process.env.WC_ORDER_STATUS_FILE || "/app/bridge/store/wc-order-status.json";
+let orderStatusCache = {};
+try {
+  if (fs.existsSync(WC_ORDER_STATUS_FILE)) {
+    orderStatusCache = JSON.parse(fs.readFileSync(WC_ORDER_STATUS_FILE, "utf8"));
+  }
+} catch (err) {
+  console.warn(`[warn] no se pudo leer WC_ORDER_STATUS_FILE: ${err.message}`);
+}
+function saveOrderStatusCache() {
+  try {
+    fs.mkdirSync(path.dirname(WC_ORDER_STATUS_FILE), { recursive: true });
+    fs.writeFileSync(WC_ORDER_STATUS_FILE, JSON.stringify(orderStatusCache), "utf8");
+  } catch (err) {
+    console.error(`[error] no se pudo guardar WC_ORDER_STATUS_FILE: ${err.message}`);
+  }
+}
+
+// Convierte un telefono de WooCommerce (formato libre: "6141385204",
+// "614 138 5204", "+52 614 138 5204", etc.) al JID de WhatsApp. Especifico
+// para numeros mexicanos: WhatsApp exige un "1" extra despues del "52".
+function phoneToWhatsAppJID(rawPhone) {
+  let digits = (rawPhone || "").replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 10) {
+    // Numero local de 10 digitos -> asumimos Mexico, agregamos 52 + 1.
+    digits = "521" + digits;
+  } else if (digits.length === 12 && digits.startsWith("52")) {
+    // 52 + 10 digitos, falta el "1" que exige WhatsApp.
+    digits = "521" + digits.slice(2);
+  }
+  // Si ya viene con 13 digitos empezando en "521", se usa tal cual.
+  return `${digits}@s.whatsapp.net`;
+}
+
+function formatMoney(value) {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n.toFixed(2) : String(value || "0");
+}
+
+function buildOrderSummary(order) {
+  const items = Array.isArray(order.line_items)
+    ? order.line_items.map((li) => `• ${li.quantity}x ${li.name}`).join("\n")
+    : "";
+  const shippingLine =
+    Array.isArray(order.shipping_lines) && order.shipping_lines.length > 0
+      ? order.shipping_lines[0].method_title || "Envio"
+      : "Recoleccion en tienda";
+  return { items, total: formatMoney(order.total), shipping: shippingLine };
+}
+
+const ORDER_STATUS_TEMPLATES = {
+  pending: (o, s) =>
+    `Recibimos tu pedido *#${o.number || o.id}* 💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\nEsta pendiente de confirmacion de pago.`,
+  processing: (o, s) =>
+    `¡Tu pedido *#${o.number || o.id}* ya esta en preparacion! 🖨️💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\nTe avisamos en cuanto este listo ✨`,
+  "on-hold": (o, s) =>
+    `Tu pedido *#${o.number || o.id}* esta en espera ⏳💜 (normalmente por confirmacion de pago). En cuanto se confirme, seguimos con tu pedido.`,
+  completed: (o, s) =>
+    `¡Tu pedido *#${o.number || o.id}* ya esta listo! 🎉💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\n¡Gracias por tu compra! 🥰`,
+  cancelled: (o, s) => `Tu pedido *#${o.number || o.id}* fue cancelado 💔. Si crees que es un error, escribenos.`,
+  refunded: (o, s) => `Tu pedido *#${o.number || o.id}* fue reembolsado 💜. Cualquier duda, aqui andamos.`,
+  failed: (o, s) =>
+    `Hubo un problema con el pago de tu pedido *#${o.number || o.id}* 😕. Puedes intentar de nuevo o escribenos si necesitas ayuda.`,
+};
+
+function buildOrderMessage(order) {
+  const summary = buildOrderSummary(order);
+  const template = ORDER_STATUS_TEMPLATES[order.status];
+  if (template) return template(order, summary);
+  // Estado no reconocido (personalizado en WooCommerce) - mensaje generico.
+  return `Tu pedido *#${order.number || order.id}* cambio de estado a: ${order.status} 💜`;
+}
+
+function verifyWooSignature(req) {
+  if (!WC_WEBHOOK_SECRET) return false;
+  const signature = req.get("x-wc-webhook-signature");
+  if (!signature || !req.rawBody) return false;
+  try {
+    const computed = crypto.createHmac("sha256", WC_WEBHOOK_SECRET).update(req.rawBody).digest("base64");
+    const a = Buffer.from(signature);
+    const b = Buffer.from(computed);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (err) {
+    return false;
+  }
+}
+
 const app = express();
 app.use(express.json({ limit: "15mb" })); // media payloads can include base64 images
 
@@ -323,6 +445,13 @@ app.post("/whatsapp/webhook", async (req, res) => {
   if (isBroadcastJID(chatJID)) {
     console.log(`[skip] mensaje de difusion/estado ignorado: ${chatJID} (sender=${sender})`);
     return res.status(200).json({ skipped: "broadcast-or-status" });
+  }
+
+  // El bot no contesta en grupos salvo que se active explicitamente con
+  // RESPOND_IN_GROUPS=true (ver definicion de isGroupJID arriba).
+  if (!RESPOND_IN_GROUPS && isGroupJID(chatJID)) {
+    console.log(`[skip] mensaje de grupo ignorado (IA desactivada para grupos): ${chatJID} (sender=${sender})`);
+    return res.status(200).json({ skipped: "group-disabled" });
   }
 
   const trimmedContent = (content || "").trim();
@@ -412,4 +541,68 @@ app.listen(PORT, "0.0.0.0", () => {
       ALLOWED_CHAT_JIDS.length ? ALLOWED_CHAT_JIDS.join(", ") : "(ninguna - abierto a todos)"
     }`
   );
+});
+
+// ---- Servidor SEPARADO para el webhook de WooCommerce ----
+// A proposito usa su propio puerto/app de Express, distinto de PORT (8769).
+// Asi, cuando se publique un puerto a internet para que WooCommerce pueda
+// llamarlo, NUNCA se expone por accidente /whatsapp/webhook (que solo debe
+// hablar con el bridge por localhost).
+const wcApp = express();
+wcApp.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf; // necesario para verificar la firma HMAC exacta
+    },
+  })
+);
+
+wcApp.post("/woocommerce/webhook", async (req, res) => {
+  if (!WC_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: "WC_WEBHOOK_SECRET no configurado" });
+  }
+  if (!verifyWooSignature(req)) {
+    console.warn("[wc] firma invalida - solicitud rechazada");
+    return res.status(401).json({ error: "invalid signature" });
+  }
+
+  const order = req.body || {};
+  if (!order.id) {
+    // Probablemente el "ping" de prueba que manda WooCommerce al crear el webhook.
+    return res.status(200).json({ ok: true, note: "sin id de pedido, ignorado" });
+  }
+
+  const lastStatus = orderStatusCache[order.id];
+  if (lastStatus === order.status) {
+    // Evita reenviar el mismo mensaje cuando WooCommerce dispara el webhook
+    // por ediciones del pedido que no son un cambio de estado real.
+    return res.status(200).json({ ok: true, skipped: "same-status" });
+  }
+
+  const jid = phoneToWhatsAppJID(order.billing && order.billing.phone);
+  if (!jid) {
+    console.warn(`[wc] pedido #${order.id} sin telefono valido - no se pudo notificar`);
+    orderStatusCache[order.id] = order.status;
+    saveOrderStatusCache();
+    return res.status(200).json({ ok: true, skipped: "no-phone" });
+  }
+
+  try {
+    const message = buildOrderMessage(order);
+    await sendReply(jid, message);
+    orderStatusCache[order.id] = order.status;
+    saveOrderStatusCache();
+    console.log(`[wc] pedido #${order.id} (${order.status}) -> notificado a ${jid}`);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error(`[wc] error notificando pedido #${order.id}: ${err.message}`);
+    // No actualizamos el cache de estado para que, si WooCommerce reintenta
+    // la entrega del webhook, se vuelva a intentar mandar el mensaje.
+    res.status(500).json({ error: err.message });
+  }
+});
+
+wcApp.listen(WOOCOMMERCE_PORT, "0.0.0.0", () => {
+  console.log(`[woocommerce] webhook escuchando en puerto ${WOOCOMMERCE_PORT}`);
+  console.log(`[woocommerce] secreto configurado: ${WC_WEBHOOK_SECRET ? "si" : "NO (webhook desactivado)"}`);
 });
