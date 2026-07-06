@@ -209,6 +209,26 @@ function trimHistory(chatJID) {
   while (history.length > HISTORY_LIMIT) history.shift();
 }
 
+// El bridge reenvia TAMBIEN los mensajes que el propio numero manda
+// (FORWARD_SELF=true por defecto en el bridge) - esto incluye tanto los que
+// manda nuestro bot via sendReply() como los que el dueno escribe DIRECTO
+// desde su telefono en la conversacion del cliente. Para distinguir unos de
+// otros (y asi detectar cuando el humano esta escribiendo el mismo), se
+// recuerda el ultimo mensaje que EL BOT mando a cada chat por un rato corto;
+// si un mensaje isFromMe no coincide con eso, es del humano, no del bot.
+const lastBotMessage = new Map(); // chatJID -> { content, at }
+const SELF_ECHO_WINDOW_MS = 15000;
+
+function rememberBotMessage(chatJID, content) {
+  lastBotMessage.set(chatJID, { content, at: Date.now() });
+}
+
+function isOwnEcho(chatJID, content) {
+  const last = lastBotMessage.get(chatJID);
+  if (!last) return false;
+  return Date.now() - last.at < SELF_ECHO_WINDOW_MS && last.content === content;
+}
+
 async function sendReply(recipient, message) {
   // Ultima linea de defensa: nunca enviar nada a un JID de difusion/estado,
   // pase lo que pase mas arriba en el flujo (ver isBroadcastJID arriba).
@@ -233,18 +253,75 @@ async function sendReply(recipient, message) {
       `bridge /send failed: status=${res.status} body=${JSON.stringify(data)}`
     );
   }
+  rememberBotMessage(recipient, message);
   return data;
 }
 
+// ---- Pausa cuando un humano toma el control de una conversacion ----
+// Cuando el bot deriva un chat a un humano (derivarHumano), o el dueno lo
+// pausa manualmente con /pausar, la IA deja de contestar en ese chat hasta
+// que el dueno lo reanude con /reanudar, o hasta que pase el tiempo maximo
+// (HUMAN_PAUSE_HOURS) - lo que ocurra primero. Sin esto, el bot seguia
+// contestando encima del humano que ya estaba atendiendo al cliente.
+const PAUSED_CHATS_FILE = process.env.PAUSED_CHATS_FILE || "/app/bridge/store/paused-chats.json";
+const HUMAN_PAUSE_HOURS = parseFloat(process.env.HUMAN_PAUSE_HOURS || "3");
+
+let pausedChats = {};
+try {
+  if (fs.existsSync(PAUSED_CHATS_FILE)) {
+    pausedChats = JSON.parse(fs.readFileSync(PAUSED_CHATS_FILE, "utf8"));
+  }
+} catch (err) {
+  console.warn(`[warn] no se pudo leer PAUSED_CHATS_FILE: ${err.message}`);
+}
+
+function savePausedChats() {
+  try {
+    fs.mkdirSync(path.dirname(PAUSED_CHATS_FILE), { recursive: true });
+    fs.writeFileSync(PAUSED_CHATS_FILE, JSON.stringify(pausedChats), "utf8");
+  } catch (err) {
+    console.error(`[error] no se pudo guardar PAUSED_CHATS_FILE: ${err.message}`);
+  }
+}
+
+function pauseChat(chatJID, reason) {
+  pausedChats[chatJID] = { since: Date.now(), reason: reason || "" };
+  savePausedChats();
+}
+
+function resumeChat(chatJID) {
+  const existed = Object.prototype.hasOwnProperty.call(pausedChats, chatJID);
+  delete pausedChats[chatJID];
+  savePausedChats();
+  return existed;
+}
+
+function isChatPaused(chatJID) {
+  const entry = pausedChats[chatJID];
+  if (!entry) return false;
+  const hoursElapsed = (Date.now() - entry.since) / (1000 * 60 * 60);
+  if (hoursElapsed > HUMAN_PAUSE_HOURS) {
+    // Expiro sola - la IA vuelve a contestar automaticamente.
+    delete pausedChats[chatJID];
+    savePausedChats();
+    return false;
+  }
+  return true;
+}
+
 async function notifyAdmin(chatJID, razon) {
+  pauseChat(chatJID, razon);
   if (!ADMIN_CHAT_JID) {
     console.warn(`[warn] derivarHumano llamado pero ADMIN_CHAT_JID no esta configurado (chat=${chatJID}, razon=${razon})`);
     return;
   }
-  const msg = `⚠️ Cliente necesita atencion humana\nChat: ${chatJID}\nMotivo: ${razon}`;
+  const msg =
+    `⚠️ Cliente necesita atencion humana\nChat: ${chatJID}\nMotivo: ${razon}\n\n` +
+    `La IA se pauso en este chat (no va a contestar ahi hasta que la reanudes). ` +
+    `Cuando termines de atender, manda:\n/reanudar ${chatJID}`;
   try {
     await sendReply(ADMIN_CHAT_JID, msg);
-    console.log(`[handoff] notificado a ${ADMIN_CHAT_JID} sobre ${chatJID}: ${razon}`);
+    console.log(`[handoff] notificado a ${ADMIN_CHAT_JID} sobre ${chatJID}: ${razon} (chat pausado)`);
   } catch (err) {
     console.error(`[error] no se pudo notificar al admin: ${err.message}`);
   }
@@ -385,6 +462,7 @@ function buildOrderSummary(order) {
       : "Recoleccion en tienda";
   return { items, total: formatMoney(order.total), shipping: shippingLine };
 }
+
 // Formato de marca fijo, usado en todos los mensajes de pedido (definido
 // por el dueno del negocio): encabezado, saludo, detalle del pedido, total,
 // envio, mensaje especifico del estado, y cierre con link + hashtag.
@@ -469,6 +547,7 @@ function buildOrderMessage(order) {
     closing: "Cualquier duda, escríbenos por este medio.",
   });
 }
+
 function verifyWooSignature(req) {
   if (!WC_WEBHOOK_SECRET) return false;
   const signature = req.get("x-wc-webhook-signature");
@@ -482,6 +561,7 @@ function verifyWooSignature(req) {
     return false;
   }
 }
+
 const app = express();
 app.use(express.json({ limit: "15mb" })); // media payloads can include base64 images
 
@@ -492,6 +572,35 @@ app.post("/whatsapp/webhook", async (req, res) => {
   const { sender, content, chatJID, isFromMe, mediaType } = payload;
 
   if (isFromMe) {
+    // El bridge reenvia tambien lo que el propio numero manda (incluye
+    // nuestras respuestas del bot Y lo que el dueno escriba directo desde su
+    // telefono). Si coincide con lo ultimo que mando el bot, es solo el eco
+    // de nuestro propio mensaje - se ignora sin mas.
+    if (chatJID && isOwnEcho(chatJID, content)) {
+      return res.status(200).json({ skipped: "isFromMe-echo" });
+    }
+
+    const trimmed = (content || "").trim().toLowerCase();
+
+    // Si el dueno escribe "/reanudar" DIRECTO en la conversacion del cliente
+    // (no hace falta ir a otro chat), la IA vuelve a contestar ahi.
+    if (chatJID && trimmed === "/reanudar") {
+      resumeChat(chatJID);
+      console.log(`[auto-pause] /reanudar escrito directo en ${chatJID} - IA reanudada`);
+      return res.status(200).json({ skipped: "isFromMe-resume-command" });
+    }
+
+    // Cualquier otro mensaje escrito directo (no es un eco del bot) significa
+    // que el dueno/un humano ya esta atendiendo esta conversacion en persona
+    // desde su telefono - pausamos la IA ahi automaticamente, sin que haga
+    // falta ningun comando.
+    if (chatJID && !isBroadcastJID(chatJID) && !isGroupJID(chatJID)) {
+      const yaEstabaPausado = isChatPaused(chatJID);
+      pauseChat(chatJID, "El dueno escribio directo en la conversacion");
+      if (!yaEstabaPausado) {
+        console.log(`[auto-pause] humano escribiendo directo en ${chatJID} - IA pausada automaticamente`);
+      }
+    }
     return res.status(200).json({ skipped: "isFromMe" });
   }
 
@@ -547,19 +656,70 @@ app.post("/whatsapp/webhook", async (req, res) => {
       return res.status(200).json({ ok: true, command: "borrar" });
     }
 
+    if (lower.startsWith("/pausar")) {
+      const target = trimmedContent.slice("/pausar".length).trim();
+      if (target) {
+        pauseChat(target, "Pausado manualmente por el dueno");
+        console.log(`[owner] /pausar: ${target}`);
+        await sendReply(
+          chatJID,
+          `⏸️ IA pausada para ${target}. Manda /reanudar ${target} cuando quieras que el bot vuelva a contestar ahi.`
+        );
+      } else {
+        await sendReply(chatJID, "Usa: /pausar <chatJID>\nEj: /pausar 5216141005072@s.whatsapp.net");
+      }
+      return res.status(200).json({ ok: true, command: "pausar" });
+    }
+
+    if (lower.startsWith("/reanudar")) {
+      const target = trimmedContent.slice("/reanudar".length).trim();
+      if (target) {
+        const existed = resumeChat(target);
+        console.log(`[owner] /reanudar: ${target} (existia=${existed})`);
+        await sendReply(
+          chatJID,
+          existed ? `▶️ IA reanudada para ${target}.` : `Ese chat no estaba pausado (${target}).`
+        );
+      } else {
+        await sendReply(chatJID, "Usa: /reanudar <chatJID>\nEj: /reanudar 5216141005072@s.whatsapp.net");
+      }
+      return res.status(200).json({ ok: true, command: "reanudar" });
+    }
+
+    if (lower === "/pausados") {
+      const entries = Object.entries(pausedChats);
+      const body = entries.length
+        ? entries
+            .map(([jid, info]) => `• ${jid} (${info.reason || "sin motivo"})`)
+            .join("\n")
+        : "(ningun chat pausado ahorita)";
+      await sendReply(chatJID, `⏸️ Chats pausados:\n${body}`);
+      return res.status(200).json({ ok: true, command: "pausados" });
+    }
+
     if (lower === "/ayuda" || lower === "/help") {
       await sendReply(
         chatJID,
         "Comandos disponibles:\n" +
           "/actualizar <texto> - agrega info nueva (promos, cambios de precio, etc)\n" +
           "/ver - muestra las actualizaciones actuales\n" +
-          "/borrar - borra todas las actualizaciones"
+          "/borrar - borra todas las actualizaciones\n" +
+          "/pausar <chatJID> - pausa la IA en ese chat (para atenderlo tu)\n" +
+          "/reanudar <chatJID> - reanuda la IA en ese chat\n" +
+          "/pausados - lista los chats pausados ahorita"
       );
       return res.status(200).json({ ok: true, command: "ayuda" });
     }
     // Si no es un comando reconocido, sigue el flujo normal - el dueno
     // tambien puede platicar con el bot para probarlo (si su numero esta
     // en ALLOWED_CHAT_JIDS).
+  }
+
+  // Si un humano ya tomo el control de este chat (derivarHumano, o /pausar
+  // manual), la IA no contesta aqui hasta que se reanude con /reanudar.
+  if (isChatPaused(chatJID)) {
+    console.log(`[skip] chat pausado (humano atendiendo): ${chatJID}`);
+    return res.status(200).json({ skipped: "human-paused" });
   }
 
   if (ALLOWED_CHAT_JIDS.length > 0 && !ALLOWED_CHAT_JIDS.includes(chatJID)) {
