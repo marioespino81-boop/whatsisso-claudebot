@@ -30,8 +30,9 @@ RUN chmod +x /app/entrypoint.sh /app/bridge/whatsapp-bridge
 # Persistent state: WhatsApp session auth + message history (SQLite) + bridge token
 VOLUME ["/app/bridge/store"]
 
-# Nothing needs to be reachable from outside the container - bridge (8080)
-# and auto-responder (8769) only talk to each other over localhost.
-EXPOSE 8080 8769
+# Bridge (8080) and auto-responder (8769) solo hablan entre si por
+# localhost - nunca se publican a internet. El puerto 8790 es el UNICO
+# pensado para exponerse (webhook de WooCommerce).
+EXPOSE 8080 8769 8790
 
 ENTRYPOINT ["/app/entrypoint.sh"]
