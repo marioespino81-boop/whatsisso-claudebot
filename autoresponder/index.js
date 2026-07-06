@@ -412,25 +412,16 @@ function buildOrderMessage(order) {
 function verifyWooSignature(req) {
   if (!WC_WEBHOOK_SECRET) return false;
   const signature = req.get("x-wc-webhook-signature");
-  // DEBUG TEMPORAL: para diagnosticar el 401 - quitar despues de resolver.
-  console.log(
-    `[wc-debug] content-type="${req.get("content-type")}" signature-header="${signature}" rawBody-len=${
-      req.rawBody ? req.rawBody.length : "undefined"
-    } secret-len=${WC_WEBHOOK_SECRET.length}`
-  );
   if (!signature || !req.rawBody) return false;
   try {
     const computed = crypto.createHmac("sha256", WC_WEBHOOK_SECRET).update(req.rawBody).digest("base64");
-    console.log(`[wc-debug] computed="${computed}" received="${signature}" match=${computed === signature}`);
     const a = Buffer.from(signature);
     const b = Buffer.from(computed);
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   } catch (err) {
-    console.error(`[wc-debug] error: ${err.message}`);
     return false;
   }
 }
-
 const app = express();
 app.use(express.json({ limit: "15mb" })); // media payloads can include base64 images
 
