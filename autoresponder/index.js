@@ -385,20 +385,76 @@ function buildOrderSummary(order) {
       : "Recoleccion en tienda";
   return { items, total: formatMoney(order.total), shipping: shippingLine };
 }
+// Formato de marca fijo, usado en todos los mensajes de pedido (definido
+// por el dueno del negocio): encabezado, saludo, detalle del pedido, total,
+// envio, mensaje especifico del estado, y cierre con link + hashtag.
+const STORE_LINK = "www.issoimprenta.com.mx";
+const STORE_TAGLINE = "💜 #issovibes";
+
+function renderOrderMessage({ header, intro, summary, closing }) {
+  return (
+    `${header}\n\n` +
+    `${intro}\n\n` +
+    `📦 Detalle del pedido:\n${summary.items}\n\n` +
+    `💰 Total: $${summary.total} MXN\n` +
+    `🚚 Entrega: ${summary.shipping}\n\n` +
+    `${closing}\n\n` +
+    `🌐 ${STORE_LINK}\n` +
+    `${STORE_TAGLINE}`
+  );
+}
 
 const ORDER_STATUS_TEMPLATES = {
   pending: (o, s) =>
-    `Recibimos tu pedido *#${o.number || o.id}* 💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\nEsta pendiente de confirmacion de pago.`,
+    renderOrderMessage({
+      header: "💜 ¡Gracias por tu pedido en ISSO Imprenta!",
+      intro: `Recibimos tu pedido #${o.number || o.id} 🖨️✨`,
+      summary: s,
+      closing:
+        "⏳ Tu pedido está pendiente de confirmación de pago. En cuanto se confirme, comenzaremos con la preparación.",
+    }),
   processing: (o, s) =>
-    `¡Tu pedido *#${o.number || o.id}* ya esta en preparacion! 🖨️💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\nTe avisamos en cuanto este listo ✨`,
+    renderOrderMessage({
+      header: "🖨️💜 ¡Tu pedido ya está en preparación!",
+      intro: `Hola, gracias por comprar en ISSO Imprenta.\n\nTu pedido *#${o.number || o.id}* ya está siendo preparado con mucho cuidado ✨`,
+      summary: s,
+      closing: "Te avisaremos por este medio en cuanto esté listo para recoger o enviar.",
+    }),
   "on-hold": (o, s) =>
-    `Tu pedido *#${o.number || o.id}* esta en espera ⏳💜 (normalmente por confirmacion de pago). En cuanto se confirme, seguimos con tu pedido.`,
+    renderOrderMessage({
+      header: "⏳💜 Tu pedido está en espera",
+      intro: `Hola, tu pedido *#${o.number || o.id}* en ISSO Imprenta está en espera (normalmente por confirmación de pago).`,
+      summary: s,
+      closing: "En cuanto se confirme, seguimos con la preparación de tu pedido.",
+    }),
   completed: (o, s) =>
-    `¡Tu pedido *#${o.number || o.id}* ya esta listo! 🎉💜\n${s.items}\nTotal: $${s.total} MXN\nEnvio: ${s.shipping}\n¡Gracias por tu compra! 🥰`,
-  cancelled: (o, s) => `Tu pedido *#${o.number || o.id}* fue cancelado 💔. Si crees que es un error, escribenos.`,
-  refunded: (o, s) => `Tu pedido *#${o.number || o.id}* fue reembolsado 💜. Cualquier duda, aqui andamos.`,
+    renderOrderMessage({
+      header: "🎉💜 ¡Tu pedido ya está listo!",
+      intro: `Hola, tu pedido *#${o.number || o.id}* de ISSO Imprenta ya está listo ✨`,
+      summary: s,
+      closing: "¡Gracias por tu compra! 🥰",
+    }),
+  cancelled: (o, s) =>
+    renderOrderMessage({
+      header: "💔 Tu pedido fue cancelado",
+      intro: `Hola, tu pedido *#${o.number || o.id}* en ISSO Imprenta fue cancelado.`,
+      summary: s,
+      closing: "Si crees que es un error o tienes dudas, escríbenos por este medio.",
+    }),
+  refunded: (o, s) =>
+    renderOrderMessage({
+      header: "💜 Tu pedido fue reembolsado",
+      intro: `Hola, tu pedido *#${o.number || o.id}* en ISSO Imprenta fue reembolsado.`,
+      summary: s,
+      closing: "Cualquier duda, aquí andamos.",
+    }),
   failed: (o, s) =>
-    `Hubo un problema con el pago de tu pedido *#${o.number || o.id}* 😕. Puedes intentar de nuevo o escribenos si necesitas ayuda.`,
+    renderOrderMessage({
+      header: "😕 Hubo un problema con tu pago",
+      intro: `Hola, tuvimos un problema al procesar el pago de tu pedido *#${o.number || o.id}* en ISSO Imprenta.`,
+      summary: s,
+      closing: "Puedes intentar de nuevo o escribirnos si necesitas ayuda.",
+    }),
 };
 
 function buildOrderMessage(order) {
@@ -406,9 +462,13 @@ function buildOrderMessage(order) {
   const template = ORDER_STATUS_TEMPLATES[order.status];
   if (template) return template(order, summary);
   // Estado no reconocido (personalizado en WooCommerce) - mensaje generico.
-  return `Tu pedido *#${order.number || order.id}* cambio de estado a: ${order.status} 💜`;
+  return renderOrderMessage({
+    header: "💜 Actualización de tu pedido",
+    intro: `Tu pedido *#${order.number || order.id}* en ISSO Imprenta cambió de estado a: ${order.status}`,
+    summary,
+    closing: "Cualquier duda, escríbenos por este medio.",
+  });
 }
-
 function verifyWooSignature(req) {
   if (!WC_WEBHOOK_SECRET) return false;
   const signature = req.get("x-wc-webhook-signature");
