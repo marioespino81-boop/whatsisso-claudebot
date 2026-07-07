@@ -10,9 +10,11 @@ const PORT = parseInt(process.env.PORT || "8769", 10);
 const BRIDGE_URL = process.env.WHATSAPP_API_URL || "http://127.0.0.1:8080/api";
 const BRIDGE_TOKEN = process.env.WHATSAPP_BRIDGE_TOKEN || "";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
-const MAX_TOKENS = parseInt(process.env.CLAUDE_MAX_TOKENS || "500", 10);
-const HISTORY_LIMIT = parseInt(process.env.HISTORY_LIMIT || "20", 10);
+// Haiku es mucho mas barato que Sonnet y sobra para conversaciones cortas
+// guiadas por un prompt de negocio bien definido (precios, promos, FAQ).
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
+const MAX_TOKENS = parseInt(process.env.CLAUDE_MAX_TOKENS || "300", 10);
+const HISTORY_LIMIT = parseInt(process.env.HISTORY_LIMIT || "12", 10);
 // Numero (JID) del dueno del negocio - recibe notificaciones cuando el bot
 // deriva una conversacion a un humano. Ej: 5216146826814@s.whatsapp.net
 const ADMIN_CHAT_JID = process.env.ADMIN_CHAT_JID || "";
@@ -339,11 +341,18 @@ async function generateReply(chatJID, incomingText) {
   history.push({ role: "user", content: incomingText });
 
   const systemPrompt = getEffectiveSystemPrompt();
+  // Prompt caching: el system prompt (~9000 caracteres, el mismo para TODAS
+  // las conversaciones) se marca como cacheable. Anthropic cobra tarifa
+  // completa la primera vez que lo ve en un rato, y una fraccion (~10%) las
+  // veces siguientes mientras el cache siga vivo (~5 min de inactividad) -
+  // como todos los clientes comparten el mismo prompt base, esto reduce
+  // fuertemente el costo por mensaje sin cambiar el comportamiento del bot.
+  const systemBlocks = [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }];
 
   let response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: MAX_TOKENS,
-    system: systemPrompt,
+    system: systemBlocks,
     tools: TOOLS,
     messages: history,
   });
@@ -374,7 +383,7 @@ async function generateReply(chatJID, incomingText) {
     response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: MAX_TOKENS,
-      system: systemPrompt,
+      system: systemBlocks,
       tools: TOOLS,
       messages: history,
     });
