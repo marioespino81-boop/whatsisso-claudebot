@@ -298,6 +298,13 @@ function resumeChat(chatJID) {
   return existed;
 }
 
+function resumeAllChats() {
+  const count = Object.keys(pausedChats).length;
+  pausedChats = {};
+  savePausedChats();
+  return count;
+}
+
 function isChatPaused(chatJID) {
   const entry = pausedChats[chatJID];
   if (!entry) return false;
@@ -682,6 +689,15 @@ app.post("/whatsapp/webhook", async (req, res) => {
 
     if (lower.startsWith("/reanudar")) {
       const target = trimmedContent.slice("/reanudar".length).trim();
+      if (target.toLowerCase() === "todos" || target.toLowerCase() === "all") {
+        const count = resumeAllChats();
+        console.log(`[owner] /reanudar todos: ${count} chat(s) reanudados`);
+        await sendReply(
+          chatJID,
+          count > 0 ? `▶️ IA reanudada en los ${count} chat(s) que estaban pausados.` : "No habia ningun chat pausado."
+        );
+        return res.status(200).json({ ok: true, command: "reanudar-todos" });
+      }
       if (target) {
         const existed = resumeChat(target);
         console.log(`[owner] /reanudar: ${target} (existia=${existed})`);
@@ -715,6 +731,7 @@ app.post("/whatsapp/webhook", async (req, res) => {
           "/borrar - borra todas las actualizaciones\n" +
           "/pausar <chatJID> - pausa la IA en ese chat (para atenderlo tu)\n" +
           "/reanudar <chatJID> - reanuda la IA en ese chat\n" +
+          "/reanudar todos - reanuda la IA en TODOS los chats pausados\n" +
           "/pausados - lista los chats pausados ahorita"
       );
       return res.status(200).json({ ok: true, command: "ayuda" });
