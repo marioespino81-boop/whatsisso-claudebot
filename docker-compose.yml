@@ -25,5 +25,22 @@ services:
     # ports:
     #   - "8080:8080"
 
+  # Segunda instancia: mismo bot, numero exclusivo de Lista Morada.
+  # Usa la misma imagen y el mismo .env (comparte ANTHROPIC_API_KEY, OWNER_CHAT_JID, etc.)
+  # pero con su propia sesion de WhatsApp (volumen separado) y su propio prompt.
+  whatsapp-claude-bot-morada:
+    image: ghcr.io/marioespino81-boop/whatsisso-claudebot:latest
+    container_name: whatsapp-claude-bot-morada
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - whatsapp_store_morada:/app/bridge/store
+      - ./system-prompt-morada.md:/app/config/system-prompt.md:ro
+    # Sin webhook de WooCommerce en este numero por ahora (no se publica ningun
+    # puerto). Si mas adelante se necesita, mapear a un puerto distinto al 8790,
+    # por ejemplo "8791:8790", para no chocar con la instancia principal.
+
 volumes:
   whatsapp_store:
+  whatsapp_store_morada:
