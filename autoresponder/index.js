@@ -195,6 +195,21 @@ const TOOLS = [
       required: ["razon"],
     },
   },
+  {
+    name: "marcarSoloHumano",
+    description:
+      "Etiqueta esta conversacion como PERMANENTE solo-humano: la IA nunca le vuelve a contestar automaticamente a este cliente (hasta que el dueno quite la etiqueta a mano). Usar SOLO cuando el cliente de plano no es sobre el producto que vende este bot (pide otro producto, necesita asesoria personalizada que no es sobre esto, mayoreo especial fuera de lo normal, etc.) - o sea, cuando la conversacion NUNCA va a ser algo que el bot pueda resolver, a diferencia de derivarHumano que es solo para un problema puntual de ESTE pedido/conversacion.",
+    input_schema: {
+      type: "object",
+      properties: {
+        razon: {
+          type: "string",
+          description: "Motivo breve de por que este chat queda permanentemente fuera del alcance del bot.",
+        },
+      },
+      required: ["razon"],
+    },
+  },
 ];
 
 // In-memory conversation history per chat. Lost on restart by design (MVP) -
@@ -318,6 +333,47 @@ function isChatPaused(chatJID) {
   return true;
 }
 
+// ---- Etiqueta PERMANENTE "solo humano" ----
+// A diferencia de la pausa temporal de arriba (que se reactiva sola despues
+// de HUMAN_PAUSE_HOURS), esta etiqueta NUNCA expira sola - es para clientes
+// que de plano no son del giro de Agendas Docentes (piden otro producto,
+// necesitan asesoria especial, etc.) y que el dueno decide que SIEMPRE deben
+// hablar con una persona, hasta que el dueno quite la etiqueta a mano.
+const HUMAN_ONLY_CHATS_FILE = process.env.HUMAN_ONLY_CHATS_FILE || "/app/bridge/store/human-only-chats.json";
+let humanOnlyChats = {};
+try {
+  if (fs.existsSync(HUMAN_ONLY_CHATS_FILE)) {
+    humanOnlyChats = JSON.parse(fs.readFileSync(HUMAN_ONLY_CHATS_FILE, "utf8"));
+  }
+} catch (err) {
+  console.warn(`[warn] no se pudo leer HUMAN_ONLY_CHATS_FILE: ${err.message}`);
+}
+
+function saveHumanOnlyChats() {
+  try {
+    fs.mkdirSync(path.dirname(HUMAN_ONLY_CHATS_FILE), { recursive: true });
+    fs.writeFileSync(HUMAN_ONLY_CHATS_FILE, JSON.stringify(humanOnlyChats), "utf8");
+  } catch (err) {
+    console.error(`[error] no se pudo guardar HUMAN_ONLY_CHATS_FILE: ${err.message}`);
+  }
+}
+
+function markHumanOnly(chatJID, reason) {
+  humanOnlyChats[chatJID] = { since: Date.now(), reason: reason || "" };
+  saveHumanOnlyChats();
+}
+
+function unmarkHumanOnly(chatJID) {
+  const existed = Object.prototype.hasOwnProperty.call(humanOnlyChats, chatJID);
+  delete humanOnlyChats[chatJID];
+  saveHumanOnlyChats();
+  return existed;
+}
+
+function isHumanOnly(chatJID) {
+  return Object.prototype.hasOwnProperty.call(humanOnlyChats, chatJID);
+}
+
 async function notifyAdmin(chatJID, razon) {
   pauseChat(chatJID, razon);
   if (!ADMIN_CHAT_JID) {
@@ -333,6 +389,23 @@ async function notifyAdmin(chatJID, razon) {
     console.log(`[handoff] notificado a ${ADMIN_CHAT_JID} sobre ${chatJID}: ${razon} (chat pausado)`);
   } catch (err) {
     console.error(`[error] no se pudo notificar al admin: ${err.message}`);
+  }
+}
+
+async function notifyAdminPermanentTag(chatJID, razon) {
+  markHumanOnly(chatJID, razon);
+  if (!ADMIN_CHAT_JID) {
+    console.warn(`[warn] marcarSoloHumano llamado pero ADMIN_CHAT_JID no esta configurado (chat=${chatJID}, razon=${razon})`);
+    return;
+  }
+  const msg =
+    `🏷️ Chat etiquetado como SOLO HUMANO (permanente)\nChat: ${chatJID}\nMotivo: ${razon}\n\n` +
+    `La IA no le va a volver a contestar a este cliente. Si en algun momento si aplica que le conteste, quita la etiqueta con:\n/ia ${chatJID}`;
+  try {
+    await sendReply(ADMIN_CHAT_JID, msg);
+    console.log(`[tag] notificado a ${ADMIN_CHAT_JID} sobre etiqueta permanente en ${chatJID}: ${razon}`);
+  } catch (err) {
+    console.error(`[error] no se pudo notificar al admin sobre etiqueta: ${err.message}`);
   }
 }
 
@@ -382,6 +455,15 @@ async function generateReply(chatJID, incomingText) {
           type: "tool_result",
           tool_use_id: block.id,
           content: "Notificacion enviada al equipo humano correctamente.",
+        });
+      }
+      if (block.type === "tool_use" && block.name === "marcarSoloHumano") {
+        const razon = (block.input && block.input.razon) || "sin especificar";
+        await notifyAdminPermanentTag(chatJID, razon);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: "Chat etiquetado como solo-humano correctamente.",
         });
       }
     }
@@ -483,7 +565,7 @@ function buildOrderSummary(order) {
 // por el dueno del negocio): encabezado, saludo, detalle del pedido, total,
 // envio, mensaje especifico del estado, y cierre con link + hashtag.
 const STORE_LINK = "www.issoimprenta.com.mx";
-const STORE_TAGLINE = "💜 #issovibes";
+const STORE_TAGLINE = "💜 #issovibes #pastasdurascorazoncontento";
 
 function renderOrderMessage({ header, intro, summary, closing }) {
   return (
@@ -722,6 +804,49 @@ app.post("/whatsapp/webhook", async (req, res) => {
       return res.status(200).json({ ok: true, command: "pausados" });
     }
 
+    if (lower.startsWith("/solohumano")) {
+      const target = trimmedContent.slice("/solohumano".length).trim();
+      if (target) {
+        markHumanOnly(target, "Etiquetado manualmente por el dueno");
+        console.log(`[owner] /soloHumano: ${target}`);
+        await sendReply(
+          chatJID,
+          `🏷️ ${target} etiquetado como SOLO HUMANO. La IA no le va a contestar nunca ahi hasta que le quites la etiqueta con /ia ${target}.`
+        );
+      } else {
+        await sendReply(chatJID, "Usa: /soloHumano <chatJID>\nEj: /soloHumano 5216141005072@s.whatsapp.net");
+      }
+      return res.status(200).json({ ok: true, command: "solohumano" });
+    }
+
+    if (lower.startsWith("/ia")) {
+      const target = trimmedContent.slice("/ia".length).trim();
+      if (target) {
+        const existed = unmarkHumanOnly(target);
+        console.log(`[owner] /ia: ${target} (existia=${existed})`);
+        await sendReply(
+          chatJID,
+          existed
+            ? `🤖 Etiqueta quitada de ${target}. La IA vuelve a contestar ahi normal.`
+            : `Ese chat no tenia la etiqueta de solo-humano (${target}).`
+        );
+      } else {
+        await sendReply(chatJID, "Usa: /ia <chatJID>\nEj: /ia 5216141005072@s.whatsapp.net");
+      }
+      return res.status(200).json({ ok: true, command: "ia" });
+    }
+
+    if (lower === "/etiquetados") {
+      const entries = Object.entries(humanOnlyChats);
+      const body = entries.length
+        ? entries
+            .map(([jid, info]) => `• ${jid} (${info.reason || "sin motivo"})`)
+            .join("\n")
+        : "(ningun chat etiquetado como solo-humano)";
+      await sendReply(chatJID, `🏷️ Chats solo-humano (permanente):\n${body}`);
+      return res.status(200).json({ ok: true, command: "etiquetados" });
+    }
+
     if (lower === "/ayuda" || lower === "/help") {
       await sendReply(
         chatJID,
@@ -729,16 +854,25 @@ app.post("/whatsapp/webhook", async (req, res) => {
           "/actualizar <texto> - agrega info nueva (promos, cambios de precio, etc)\n" +
           "/ver - muestra las actualizaciones actuales\n" +
           "/borrar - borra todas las actualizaciones\n" +
-          "/pausar <chatJID> - pausa la IA en ese chat (para atenderlo tu)\n" +
+          "/pausar <chatJID> - pausa la IA en ese chat un rato (para atenderlo tu)\n" +
           "/reanudar <chatJID> - reanuda la IA en ese chat\n" +
           "/reanudar todos - reanuda la IA en TODOS los chats pausados\n" +
-          "/pausados - lista los chats pausados ahorita"
+          "/pausados - lista los chats pausados temporalmente\n" +
+          "/soloHumano <chatJID> - etiqueta ese chat como PERMANENTE solo-humano (nunca expira sola)\n" +
+          "/ia <chatJID> - quita la etiqueta de solo-humano, la IA vuelve a contestar ahi\n" +
+          "/etiquetados - lista los chats con etiqueta solo-humano"
       );
       return res.status(200).json({ ok: true, command: "ayuda" });
     }
     // Si no es un comando reconocido, sigue el flujo normal - el dueno
     // tambien puede platicar con el bot para probarlo (si su numero esta
     // en ALLOWED_CHAT_JIDS).
+  }
+
+  // Etiqueta PERMANENTE: este chat nunca lo contesta la IA (ver /soloHumano).
+  if (isHumanOnly(chatJID)) {
+    console.log(`[skip] chat etiquetado como solo-humano: ${chatJID}`);
+    return res.status(200).json({ skipped: "human-only-tag" });
   }
 
   // Si un humano ya tomo el control de este chat (derivarHumano, o /pausar
