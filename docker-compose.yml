@@ -15,6 +15,10 @@ services:
       # Prompt de negocio (texto largo con formato) - se lee en vez de SYSTEM_PROMPT.
       # El archivo system-prompt.md debe existir junto a este docker-compose.yml.
       - ./system-prompt.md:/app/config/system-prompt.md:ro
+      # Script + datos del envio masivo a la Lista Morada. Se corre a mano con
+      # "docker exec -it whatsapp-claude-bot node /app/broadcast/broadcast.js <n>".
+      # rw porque el script guarda progreso.json/errores.json ahi mismo.
+      - ./broadcast:/app/broadcast:rw
     # Solo se publica el puerto 8790 (webhook de WooCommerce) - es el UNICO
     # que debe ser alcanzable desde internet. El bridge (8080) y el webhook
     # de WhatsApp (8769) siguen siendo solo-localhost dentro del contenedor.

@@ -1,2 +1,11 @@
 node_modules/
 .env
+.claude/
+
+# Datos de clientes: nunca deben subirse a un repo publico.
+broadcast/contacts.json
+broadcast/contacts_todos.json
+broadcast/revisar.json
+broadcast/ya_compraron.json
+broadcast/progreso.json
+broadcast/errores.json
